@@ -263,7 +263,13 @@ func (gc *GridCleaner) CheckAndCleanup(ctx context.Context) error {
 		return fmt.Errorf("failed to parse session info: %w", err)
 	}
 
-	gc.logger.WithField("sessionCount", len(sessions)).Info("Found active sessions")
+	sessionCount := len(sessions)
+	gc.logger.WithField("sessionCount", sessionCount).Info("Found active sessions")
+
+	if sessionCount == 0 {
+		gc.logger.Info("No sessions to clean up.")
+		return nil // Exit early if no sessions found
+	}
 
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, gc.config.MaxParallel)
@@ -288,19 +294,21 @@ func (gc *GridCleaner) CheckAndCleanup(ctx context.Context) error {
 		podName, err := gc.getPodName(session.NodeIP)
 		if err != nil {
 			logger.WithError(err).Error("Failed to get pod name")
-			gc.addError(fmt.Errorf("pod name retrieval failed for %s: %w", session.NodeIP, err))
+			gc.addError(fmt.Errorf("pod name retrieval failed for session %s on node %s: %w", session.SessionID, session.NodeIP, err)) //More context in error message
 			continue
 		}
+
+		session.PodName = podName // Store podName in SessionInfo for later use if needed
 
 		wg.Add(1)
 		sem <- struct{}{}
 
-		go func(session SessionInfo, podName string) {
+		go func(session SessionInfo) { //Simplified goroutine signature
 			defer wg.Done()
 			defer func() { <-sem }()
 
 			logger := gc.logger.WithFields(logrus.Fields{
-				"podName":   podName,
+				"podName":   session.PodName,
 				"sessionID": session.SessionID,
 				"nodeIP":    session.NodeIP,
 				"slotState": session.SlotState,
@@ -309,13 +317,13 @@ func (gc *GridCleaner) CheckAndCleanup(ctx context.Context) error {
 
 			logger.Info("Attempting pod deletion")
 
-			if err := gc.deletePod(ctx, podName); err != nil {
+			if err := gc.deletePod(context.Background(), session.PodName); err != nil { //Use context.Background() here, as the parent context is already handled.
 				logger.WithError(err).Error("Pod deletion failed")
-				gc.addError(fmt.Errorf("failed to delete pod %s: %w", podName, err))
+				gc.addError(fmt.Errorf("failed to delete pod %s: %w", session.PodName, err))
 			} else {
 				logger.Info("Successfully deleted pod")
 			}
-		}(session, podName)
+		}(session)
 	}
 
 	wg.Wait()
