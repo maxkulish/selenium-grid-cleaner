@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-	"gopkg.in/yaml.v2"
 )
 
 // Config holds the application configuration
@@ -27,7 +26,6 @@ type Config struct {
 	MaxParallel int    `yaml:"maxParallel"`
 	LogLevel    string `yaml:"logLevel"`
 	LogFormat   string `yaml:"logFormat"`
-	ConfigPath  string `yaml:"configPath"`
 }
 
 // GridStatus represents the response from the grid status endpoint
@@ -66,10 +64,20 @@ type GridCleaner struct {
 }
 
 // NewGridCleaner creates a new instance of GridCleaner
-func NewGridCleaner(config Config) (*GridCleaner, error) {
-	logger := logrus.New()
+func NewGridCleaner() (*GridCleaner, error) {
+	config := Config{
+		GridHost:    "localhost",
+		GridPort:    "4444",
+		Namespace:   "selenium",
+		MaxAgeSecs:  7200,
+		MaxRetries:  3,
+		MaxParallel: 10,
+		LogLevel:    "info",
+		LogFormat:   "text",
+	}
 
 	// Configure logging
+	logger := logrus.New()
 	level, err := logrus.ParseLevel(config.LogLevel)
 	if err != nil {
 		return nil, fmt.Errorf("invalid log level: %w", err)
@@ -135,48 +143,33 @@ func (gc *GridCleaner) checkGridHealth(ctx context.Context) error {
 	return nil
 }
 
-// getGridStatus fetches the current status from the grid with retries
-func (gc *GridCleaner) getGridStatus(ctx context.Context) (*GridStatus, error) {
-	var status *GridStatus
-	var lastErr error
-
-	for i := 0; i < gc.config.MaxRetries; i++ {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-			if i > 0 {
-				time.Sleep(time.Duration(i) * time.Second)
-			}
-
-			url := fmt.Sprintf("http://%s:%s/status", gc.config.GridHost, gc.config.GridPort)
-			gc.logger.WithField("url", url).Debug("Fetching grid status")
-
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-			if err != nil {
-				lastErr = fmt.Errorf("failed to create request: %w", err)
-				continue
-			}
-
-			resp, err := gc.client.Do(req)
-			if err != nil {
-				lastErr = fmt.Errorf("failed to get grid status: %w", err)
-				continue
-			}
-
-			status = &GridStatus{}
-			if err := json.NewDecoder(resp.Body).Decode(status); err != nil {
-				resp.Body.Close()
-				lastErr = fmt.Errorf("failed to decode response: %w", err)
-				continue
-			}
-			resp.Body.Close()
-
-			return status, nil
-		}
+// getGridStatus fetches the current status from the grid or local file.
+func (gc *GridCleaner) getGridStatus(ctx context.Context, localFile string) (*GridStatus, error) {
+	if localFile != "" {
+		gc.logger.Info("Reading Grid Status from local file: ", localFile)
+		return readLocalGridStatus(localFile)
 	}
 
-	return nil, fmt.Errorf("failed to get grid status after %d attempts: %w", gc.config.MaxRetries, lastErr)
+	url := fmt.Sprintf("http://%s:%s/status", gc.config.GridHost, gc.config.GridPort)
+	gc.logger.WithField("url", url).Debug("Fetching grid status")
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := gc.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get grid status: %w", err)
+	}
+	defer resp.Body.Close()
+
+	status := &GridStatus{}
+	if err := json.NewDecoder(resp.Body).Decode(status); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return status, nil
 }
 
 // parseSessionInfo extracts session information from grid status
@@ -246,14 +239,17 @@ func (gc *GridCleaner) deletePod(ctx context.Context, podName string) error {
 }
 
 // CheckAndCleanup performs the main cleanup operation
-func (gc *GridCleaner) CheckAndCleanup(ctx context.Context) error {
+func (gc *GridCleaner) CheckAndCleanup(ctx context.Context, localFile string) error {
 	gc.logger.Info("Starting cleanup process")
 
-	if err := gc.checkGridHealth(ctx); err != nil {
-		return fmt.Errorf("grid health check failed: %w", err)
+	// Only perform the health check if NOT using a local file
+	if localFile == "" {
+		if err := gc.checkGridHealth(ctx); err != nil {
+			return fmt.Errorf("grid health check failed: %w", err)
+		}
 	}
 
-	status, err := gc.getGridStatus(ctx)
+	status, err := gc.getGridStatus(ctx, localFile)
 	if err != nil {
 		return fmt.Errorf("failed to get grid status: %w", err)
 	}
@@ -337,93 +333,37 @@ func (gc *GridCleaner) CheckAndCleanup(ctx context.Context) error {
 	return nil
 }
 
-// DefaultConfig returns the default configuration
-func DefaultConfig() Config {
-	return Config{
-		GridHost:    "localhost",
-		GridPort:    "4444",
-		Namespace:   "selenium",
-		MaxAgeSecs:  7200,
-		MaxRetries:  3,
-		MaxParallel: 10,
-		LogLevel:    "info",
-		LogFormat:   "text",
-	}
-}
-
-// LoadConfig loads configuration from a YAML file or returns default config if path is empty
-func LoadConfig(path string) (Config, error) {
-	// Start with default configuration
-	config := DefaultConfig()
-
-	// If no config file specified, return defaults
-	if path == "" {
-		return config, nil
-	}
-
-	file, err := os.ReadFile(path)
+// readLocalGridStatus reads the GridStatus from a local JSON file.
+func readLocalGridStatus(filePath string) (*GridStatus, error) {
+	data, err := os.ReadFile(filePath)
 	if err != nil {
-		return config, fmt.Errorf("failed to read config file: %w", err)
+		return nil, fmt.Errorf("failed to read local GridStatus file: %w", err)
 	}
 
-	if err := yaml.Unmarshal(file, &config); err != nil {
-		return config, fmt.Errorf("failed to parse config file: %w", err)
+	var gridStatus GridStatus
+	if err := json.Unmarshal(data, &gridStatus); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal GridStatus from JSON: %w", err)
 	}
 
-	// Override empty values with defaults
-	if config.GridHost == "" {
-		config.GridHost = DefaultConfig().GridHost
-	}
-	if config.GridPort == "" {
-		config.GridPort = DefaultConfig().GridPort
-	}
-	if config.Namespace == "" {
-		config.Namespace = DefaultConfig().Namespace
-	}
-	if config.MaxAgeSecs == 0 {
-		config.MaxAgeSecs = DefaultConfig().MaxAgeSecs
-	}
-	if config.MaxRetries == 0 {
-		config.MaxRetries = DefaultConfig().MaxRetries
-	}
-	if config.MaxParallel == 0 {
-		config.MaxParallel = DefaultConfig().MaxParallel
-	}
-	if config.LogLevel == "" {
-		config.LogLevel = DefaultConfig().LogLevel
-	}
-	if config.LogFormat == "" {
-		config.LogFormat = DefaultConfig().LogFormat
-	}
-
-	return config, nil
+	return &gridStatus, nil
 }
 
 func main() {
-	var config Config
-	var err error
-
-	if len(os.Args) > 1 {
-		config, err = LoadConfig(os.Args[1])
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to load config file: %v\nUsing default configuration\n", err)
-			config = DefaultConfig()
-		}
-	} else {
-		config = DefaultConfig()
-		fmt.Println("No config file provided, using default configuration")
-	}
-
-	cleaner, err := NewGridCleaner(config)
+	cleaner, err := NewGridCleaner()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create cleaner: %v\n", err)
 		os.Exit(1)
 	}
 
+	var localFile string
+	if len(os.Args) > 1 {
+		localFile = os.Args[1]
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	if err := cleaner.CheckAndCleanup(ctx); err != nil {
+	if err := cleaner.CheckAndCleanup(ctx, localFile); err != nil {
 		cleaner.logger.WithError(err).Fatal("Cleanup failed")
 	}
 }
