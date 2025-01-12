@@ -20,6 +20,7 @@ type PortForwarder struct {
 	cmd         *exec.Cmd
 	running     bool
 	mu          sync.Mutex
+	done        chan struct{}
 }
 
 func NewPortForwarder(namespace, serviceName string, port int) (*PortForwarder, error) {
@@ -33,6 +34,7 @@ func NewPortForwarder(namespace, serviceName string, port int) (*PortForwarder, 
 		serviceName: serviceName,
 		port:        port,
 		localPort:   localPort,
+		done:        make(chan struct{}),
 	}
 	fmt.Printf("PortForwarder created: namespace=%s, service=%s, port=%d, localPort=%d\n",
 		namespace, serviceName, port, localPort)
@@ -44,8 +46,11 @@ func (pf *PortForwarder) Start(ctx context.Context) error {
 	defer pf.mu.Unlock()
 
 	if pf.running {
-		return nil // Already running
+		return nil
 	}
+
+	// Create a child context that we can cancel when stopping
+	childCtx, cancel := context.WithCancel(ctx)
 
 	portString := fmt.Sprintf("%d:%d", pf.localPort, pf.port)
 	args := []string{
@@ -56,19 +61,37 @@ func (pf *PortForwarder) Start(ctx context.Context) error {
 	}
 
 	fmt.Printf("kubectl %s\n", strings.Join(args, " "))
-	pf.cmd = exec.CommandContext(ctx, "kubectl", args...)
+	pf.cmd = exec.CommandContext(childCtx, "kubectl", args...)
 
-	// Create a pipe for stderr to capture potential errors
 	stderr, err := pf.cmd.StderrPipe()
 	if err != nil {
+		cancel()
 		return fmt.Errorf("failed to create stderr pipe: %w", err)
 	}
 
 	if err := pf.cmd.Start(); err != nil {
+		cancel()
 		return fmt.Errorf("starting port-forward: %w", err)
 	}
 
-	// Start a goroutine to handle stderr output
+	// Handle process cleanup in a goroutine
+	go func() {
+		defer cancel() // Ensure context is cancelled when we're done
+		defer close(pf.done)
+
+		// Wait for the command to complete
+		if err := pf.cmd.Wait(); err != nil {
+			if childCtx.Err() == nil { // Only log if we haven't cancelled deliberately
+				fmt.Printf("port-forward process ended unexpectedly: %v\n", err)
+			}
+		}
+
+		pf.mu.Lock()
+		pf.running = false
+		pf.mu.Unlock()
+	}()
+
+	// Handle stderr output
 	go func() {
 		buf := make([]byte, 1024)
 		for {
@@ -83,8 +106,7 @@ func (pf *PortForwarder) Start(ctx context.Context) error {
 	}()
 
 	// Wait for the port to become available
-	err = pf.waitForConnection(ctx)
-	if err != nil {
+	if err := pf.waitForConnection(childCtx); err != nil {
 		pf.Stop() // Clean up if connection fails
 		return fmt.Errorf("port-forward connection failed: %w", err)
 	}
@@ -120,21 +142,29 @@ func (pf *PortForwarder) waitForConnection(ctx context.Context) error {
 
 func (pf *PortForwarder) Stop() {
 	pf.mu.Lock()
-	defer pf.mu.Unlock()
-
 	if !pf.running || pf.cmd == nil {
+		pf.mu.Unlock()
 		return
 	}
-
-	if err := pf.cmd.Process.Kill(); err != nil {
-		fmt.Printf("Error killing port-forward process: %v\n", err)
-	}
-
-	if _, err := pf.cmd.Process.Wait(); err != nil {
-		fmt.Printf("Error waiting for port-forward process to exit: %v\n", err)
-	}
-	pf.cmd = nil
 	pf.running = false
+	cmd := pf.cmd
+	pf.cmd = nil
+	pf.mu.Unlock()
+
+	// Kill the process
+	if cmd.Process != nil {
+		if err := cmd.Process.Kill(); err != nil {
+			fmt.Printf("Error killing port-forward process: %v\n", err)
+		}
+	}
+
+	// Wait for the process to be fully cleaned up
+	select {
+	case <-pf.done:
+		// Process has exited
+	case <-time.After(5 * time.Second):
+		fmt.Println("Warning: Timeout waiting for port-forward process to exit")
+	}
 }
 
 func (pf *PortForwarder) GetLocalURL(remoteURL string) string {

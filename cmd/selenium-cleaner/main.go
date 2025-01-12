@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -47,6 +48,9 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// Create a WaitGroup to ensure all cleanup is done before exiting
+	var wg sync.WaitGroup
+
 	// Command line flags
 	kubeContext := flag.String("context", "", "Kubernetes context to use")
 	seleniumGridPort := flag.Int("port", 4444, "Selenium Grid port")
@@ -63,11 +67,11 @@ func main() {
 			}
 			return *kubeContext
 		}(),
-		"Grid Port":         *seleniumGridPort,
-		"Grid Namespace":    *seleniumGridNamespace,
-		"Grid Service":      *seleniumGridServiceName,
-		"Pod Lifetime":      fmt.Sprintf("%.1f hours", *podLifetimeHours),
-		"Kubeconfig":        func() string {
+		"Grid Port":      *seleniumGridPort,
+		"Grid Namespace": *seleniumGridNamespace,
+		"Grid Service":   *seleniumGridServiceName,
+		"Pod Lifetime":   fmt.Sprintf("%.1f hours", *podLifetimeHours),
+		"Kubeconfig": func() string {
 			if kc := os.Getenv("KUBECONFIG"); kc != "" {
 				return kc
 			}
@@ -89,10 +93,18 @@ func main() {
 		log.Fatalf("Failed to create port-forwarder: %v", err)
 	}
 
+	// Add to WaitGroup before starting
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-ctx.Done()
+		log.Println("Shutting down port forwarder...")
+		pf.Stop()
+	}()
+
 	if err := pf.Start(ctx); err != nil {
 		log.Fatalf("Failed to start port-forwarding: %v", err)
 	}
-	defer pf.Stop()
 
 	seleniumGridURL := fmt.Sprintf("http://localhost:%d/wd/hub/status", *seleniumGridPort)
 	localSeleniumGridURL := pf.GetLocalURL(seleniumGridURL)
@@ -119,4 +131,10 @@ func main() {
 	}
 
 	log.Println("Selenium cleaner finished successfully.")
+	// Cancel context to initiate cleanup
+	cancel()
+
+	// Wait for cleanup to complete
+	wg.Wait()
+	log.Println("Cleanup completed, exiting...")
 }
