@@ -118,15 +118,16 @@ func main() {
 
 	log.Println("Creating Kubernetes client...")
 	// Kubernetes client
-	k8sClient, err := kubernetes.NewClient(*kubeContext)
+	k8sClient, err := kubernetes.NewClient(*kubeContext, *seleniumGridNamespace)
 	if err != nil {
 		log.Fatalf("Failed to create Kubernetes client: %v", err)
 	}
 
 	log.Println("Starting pod cleanup...")
 	// Clean pods
-	err = cleaner.CleanPods(ctx, status, k8sClient, podLifetime)
-	if err != nil {
+	// Create the cleaner with configurable parallel operations
+	cleaner := cleaner.NewCleaner(k8sClient, 10) // 10 parallel operations max
+	if err := cleaner.CleanPods(ctx, status, podLifetime); err != nil {
 		log.Fatalf("Failed to clean pods: %v", err)
 	}
 
