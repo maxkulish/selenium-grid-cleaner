@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type PortForwarder struct {
@@ -48,24 +49,73 @@ func (pf *PortForwarder) Start(ctx context.Context) error {
 
 	portString := fmt.Sprintf("%d:%d", pf.localPort, pf.port)
 	args := []string{
-		"kubectl", "port-forward",
+		"port-forward",
 		"-n", pf.namespace,
 		fmt.Sprintf("service/%s", pf.serviceName),
 		portString,
 	}
 
-	fmt.Println(strings.Join(args, " "))
-	pf.cmd = exec.CommandContext(ctx, args[0], args[1:]...)
-	pf.cmd.Stderr = nil
+	fmt.Printf("kubectl %s\n", strings.Join(args, " "))
+	pf.cmd = exec.CommandContext(ctx, "kubectl", args...)
 
-	err := pf.cmd.Start()
+	// Create a pipe for stderr to capture potential errors
+	stderr, err := pf.cmd.StderrPipe()
 	if err != nil {
-		pf.Stop() // Stop if starting fails!
+		return fmt.Errorf("failed to create stderr pipe: %w", err)
+	}
+
+	if err := pf.cmd.Start(); err != nil {
 		return fmt.Errorf("starting port-forward: %w", err)
+	}
+
+	// Start a goroutine to handle stderr output
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			n, err := stderr.Read(buf)
+			if n > 0 {
+				fmt.Printf("kubectl stderr: %s", buf[:n])
+			}
+			if err != nil {
+				break
+			}
+		}
+	}()
+
+	// Wait for the port to become available
+	err = pf.waitForConnection(ctx)
+	if err != nil {
+		pf.Stop() // Clean up if connection fails
+		return fmt.Errorf("port-forward connection failed: %w", err)
 	}
 
 	pf.running = true
 	return nil
+}
+
+func (pf *PortForwarder) waitForConnection(ctx context.Context) error {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	timeout := time.After(30 * time.Second)
+
+	addr := fmt.Sprintf("localhost:%d", pf.localPort)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timeout:
+			return fmt.Errorf("timeout waiting for port-forward to be ready")
+		case <-ticker.C:
+			conn, err := net.DialTimeout("tcp", addr, time.Second)
+			if err == nil {
+				conn.Close()
+				fmt.Printf("Port-forward is ready on %s\n", addr)
+				return nil
+			}
+		}
+	}
 }
 
 func (pf *PortForwarder) Stop() {
@@ -77,12 +127,10 @@ func (pf *PortForwarder) Stop() {
 	}
 
 	if err := pf.cmd.Process.Kill(); err != nil {
-		// Log the error but don't stop execution, as the process might have already exited
 		fmt.Printf("Error killing port-forward process: %v\n", err)
 	}
 
 	if _, err := pf.cmd.Process.Wait(); err != nil {
-		// Log the error but don't stop execution, as the process might have already exited
 		fmt.Printf("Error waiting for port-forward process to exit: %v\n", err)
 	}
 	pf.cmd = nil
@@ -92,7 +140,6 @@ func (pf *PortForwarder) Stop() {
 func (pf *PortForwarder) GetLocalURL(remoteURL string) string {
 	u, err := url.Parse(remoteURL)
 	if err != nil {
-		// Handle the error appropriately, perhaps by logging and returning the original URL
 		fmt.Printf("Error parsing URL: %v\n", err)
 		return remoteURL
 	}

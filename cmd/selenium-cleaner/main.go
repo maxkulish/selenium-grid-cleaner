@@ -3,34 +3,90 @@ package main
 
 import (
 	"context"
+	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/maxkulish/selenium-grid-cleaner/internal/cleaner"
 	"github.com/maxkulish/selenium-grid-cleaner/internal/downloader"
 	"github.com/maxkulish/selenium-grid-cleaner/internal/kubernetes"
 	"github.com/maxkulish/selenium-grid-cleaner/internal/portforwarder"
-
-	"github.com/maxkulish/selenium-grid-cleaner/internal/cleaner"
 )
 
+func printConfig(params map[string]interface{}) {
+	var maxKeyLength int
+	for k := range params {
+		if len(k) > maxKeyLength {
+			maxKeyLength = len(k)
+		}
+	}
+
+	var output strings.Builder
+	output.WriteString("\nSelenium Grid Cleaner Configuration:\n")
+	output.WriteString(strings.Repeat("=", 50) + "\n")
+
+	for k, v := range params {
+		padding := strings.Repeat(" ", maxKeyLength-len(k))
+		output.WriteString(fmt.Sprintf("%s%s : %v\n", k, padding, v))
+	}
+	output.WriteString(strings.Repeat("=", 50) + "\n")
+
+	log.Print(output.String())
+}
+
 func main() {
+	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
+	log.SetPrefix("[Selenium Cleaner] ")
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// Configuration (consider using flags or config file)
-	seleniumGridURL := "http://localhost:4444/wd/hub/status"
-	seleniumGridPort := 4444
-	seleniumGridNamespace := "selenium"
-	seleniumGridServiceName := "selenium-router"
-	podLifetime := 2 * time.Hour
+	// Command line flags
+	kubeContext := flag.String("context", "", "Kubernetes context to use")
+	seleniumGridPort := flag.Int("port", 4444, "Selenium Grid port")
+	seleniumGridNamespace := flag.String("namespace", "selenium", "Selenium Grid namespace")
+	seleniumGridServiceName := flag.String("service", "selenium-router", "Selenium Grid service name")
+	podLifetimeHours := flag.Float64("lifetime", 2.0, "Pod lifetime in hours")
+	flag.Parse()
 
+	// Log configuration parameters
+	config := map[string]interface{}{
+		"Kubernetes Context": func() string {
+			if *kubeContext == "" {
+				return "default from kubeconfig"
+			}
+			return *kubeContext
+		}(),
+		"Grid Port":         *seleniumGridPort,
+		"Grid Namespace":    *seleniumGridNamespace,
+		"Grid Service":      *seleniumGridServiceName,
+		"Pod Lifetime":      fmt.Sprintf("%.1f hours", *podLifetimeHours),
+		"Kubeconfig":        func() string {
+			if kc := os.Getenv("KUBECONFIG"); kc != "" {
+				return kc
+			}
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return "unknown"
+			}
+			return filepath.Join(home, ".kube", "config")
+		}(),
+	}
+	printConfig(config)
+
+	podLifetime := time.Duration(*podLifetimeHours * float64(time.Hour))
+
+	log.Println("Starting port forwarder...")
 	// Port-forwarding
-	pf, err := portforwarder.NewPortForwarder(seleniumGridNamespace, seleniumGridServiceName, seleniumGridPort)
+	pf, err := portforwarder.NewPortForwarder(*seleniumGridNamespace, *seleniumGridServiceName, *seleniumGridPort)
 	if err != nil {
-		log.Fatalf("Failed to create port-forwarder: %v (namespace: %s, service: %s, port: %d)", err, seleniumGridNamespace, seleniumGridServiceName, seleniumGridPort)
+		log.Fatalf("Failed to create port-forwarder: %v", err)
 	}
 
 	if err := pf.Start(ctx); err != nil {
@@ -38,33 +94,29 @@ func main() {
 	}
 	defer pf.Stop()
 
-	go func() { // Goroutine to handle signals
-		<-ctx.Done()
-		log.Println("Stopping port forwarding due to signal...")
-		pf.Stop() // Explicitly stop port forwarding
-		// Add other cleanup tasks here if needed.
-		os.Exit(0) // or other appropriate exit code
-	}()
-
+	seleniumGridURL := fmt.Sprintf("http://localhost:%d/wd/hub/status", *seleniumGridPort)
 	localSeleniumGridURL := pf.GetLocalURL(seleniumGridURL)
 
+	log.Println("Downloading Selenium Grid status...")
 	// Download status.json
 	status, err := downloader.DownloadStatus(localSeleniumGridURL)
 	if err != nil {
 		log.Fatalf("Failed to download status: %v", err)
 	}
 
+	log.Println("Creating Kubernetes client...")
 	// Kubernetes client
-	k8sClient, err := kubernetes.NewClient()
+	k8sClient, err := kubernetes.NewClient(*kubeContext)
 	if err != nil {
 		log.Fatalf("Failed to create Kubernetes client: %v", err)
 	}
 
+	log.Println("Starting pod cleanup...")
 	// Clean pods
 	err = cleaner.CleanPods(ctx, status, k8sClient, podLifetime)
 	if err != nil {
 		log.Fatalf("Failed to clean pods: %v", err)
 	}
 
-	log.Println("Selenium cleaner finished.")
+	log.Println("Selenium cleaner finished successfully.")
 }
